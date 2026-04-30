@@ -8,3 +8,5 @@ Python microservice under `ai-service/` exposing:
 - `GET /health` (default port `5000`)
 
 Docs: `ai-service/AI_DOCS.md`
+
+- Day 1: added catch-up file `regulatory-filing-automation/days/day-1.md`

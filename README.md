@@ -10,3 +10,4 @@ Python microservice under `ai-service/` exposing:
 Docs: `ai-service/AI_DOCS.md`
 
 - Day 1: added catch-up file `regulatory-filing-automation/days/day-1.md`
+- Day 2: added `ai-service/services/groq_client.py` with retry + backoff

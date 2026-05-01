@@ -14,9 +14,30 @@ def models():
         models = client.list_models()
         # Keep response small + easy to scan
         ids = [m.get("id") for m in models if m.get("id")]
-        return jsonify({"models": ids, "count": len(ids)})
+        return jsonify(
+            {
+                "data": {"models": ids, "count": len(ids)},
+                "meta": {"is_fallback": False},
+            }
+        )
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return (
+            jsonify(
+                {
+                    "data": {"models": [], "count": 0},
+                    "meta": {"is_fallback": True, "error_detail": str(e)},
+                }
+            ),
+            200,
+        )
     except Exception as e:
-        return jsonify({"error": "Unexpected error", "detail": str(e)}), 500
+        return (
+            jsonify(
+                {
+                    "data": {"models": [], "count": 0},
+                    "meta": {"is_fallback": True, "error_detail": str(e)},
+                }
+            ),
+            200,
+        )
 

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+import json
+import logging
 
 from flask import Blueprint, jsonify, request
 
 from services.cache import ResponseCache
-from services.groq_client import GroqClient
+from services.groq_client import GroqClient, GroqServiceException
 from services.prompt_store import PromptStore
+from services.response_builder import build_response
 
 from ._shared import require_json, stable_key
 
@@ -17,6 +19,8 @@ _cache = ResponseCache(
     ttl_s=int(os.getenv("AI_CACHE_TTL_S", "600")),
     max_entries=int(os.getenv("AI_CACHE_MAX_ENTRIES", "1024")),
 )
+
+logger = logging.getLogger(__name__)
 _prompts = PromptStore.from_default_location()
 
 
@@ -26,6 +30,13 @@ def _get_client() -> GroqClient:
 
 @bp.post("/generate-report")
 def generate_report():
+    fallback_response = {
+        "title": "Report Unavailable",
+        "executive_summary": "AI service temporarily unavailable. Please retry in a few minutes.",
+        "overview": "",
+        "top_items": [],
+        "recommendations": [],
+    }
     try:
         payload = require_json(request)
 
@@ -45,9 +56,9 @@ def generate_report():
             )
 
         model = payload.get("model")
-        temperature = payload.get("temperature", 0.3)
+        temperature = payload.get("temperature", 0.5)
         top_p = payload.get("top_p", 1.0)
-        max_tokens = payload.get("max_tokens", 1200)
+        max_tokens = payload.get("max_tokens", 1000)
 
         system_prompt = payload.get(
             "system_prompt",
@@ -60,6 +71,7 @@ def generate_report():
             filing_type=filing_type,
             period=period,
             notes=notes,
+            filing_data=json.dumps(payload.get("filing_data", {}), sort_keys=True),
         )
 
         cache_key = stable_key(
@@ -74,24 +86,35 @@ def generate_report():
             },
         )
 
-        cached = _cache.get(cache_key)
-        if cached is not None:
-            return jsonify({"cached": True, **cached})
+        cached_result = _cache.get(cache_key)
+        if cached_result is not None:
+            cached_result["meta"]["cached"] = True
+            return jsonify(cached_result), 200
 
         client = _get_client()
-        content, raw = client.chat(
+        content_str, groq_info = client.chat(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=model,
             temperature=float(temperature),
             top_p=float(top_p),
             max_tokens=int(max_tokens),
+            response_format={"type": "json_object"},
         )
 
-        result: dict[str, Any] = {"content": content, "raw": raw}
-        _cache.set(cache_key, result)
-        return jsonify({"cached": False, **result})
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        try:
+            parsed_content = GroqClient.parse_json_response(content_str)
+        except ValueError as e:
+            logger.error("JSON parsing failed for /generate-report: %s", e)
+            groq_info["is_fallback"] = True
+            return jsonify({"data": fallback_response, "meta": groq_info}), 200
+
+        response_data = build_response(parsed_content, groq_info, cached=False)
+        _cache.set(cache_key, response_data)
+        return jsonify(response_data), 200
+    except (ValueError, GroqServiceException) as e:
+        logger.error("Error in /generate-report: %s", e)
+        return jsonify({"data": fallback_response, "meta": {"is_fallback": True, "error_detail": str(e)}}), 200
     except Exception as e:
-        return jsonify({"error": "Unexpected error", "detail": str(e)}), 500
+        logger.exception("Unexpected error in /generate-report endpoint")
+        return jsonify({"data": fallback_response, "meta": {"is_fallback": True, "error_detail": str(e)}}), 200

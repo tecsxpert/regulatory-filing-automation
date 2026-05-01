@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-import os
 import json
 import logging
+import os
+import threading
+import uuid
+from datetime import datetime, timezone
+from typing import Any
 
 from flask import Blueprint, jsonify, request
 
@@ -22,14 +26,26 @@ _cache = ResponseCache(
 
 logger = logging.getLogger(__name__)
 _prompts = PromptStore.from_default_location()
+_jobs: dict[str, dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
 
 
 def _get_client() -> GroqClient:
     return GroqClient.from_env()
 
 
-@bp.post("/generate-report")
-def generate_report():
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _set_job(job_id: str, **updates: Any) -> None:
+    with _jobs_lock:
+        job = _jobs.setdefault(job_id, {})
+        job.update(updates)
+        job["updated_at"] = _utc_now()
+
+
+def _build_report_response(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
     fallback_response = {
         "title": "Report Unavailable",
         "executive_summary": "AI service temporarily unavailable. Please retry in a few minutes.",
@@ -37,9 +53,8 @@ def generate_report():
         "top_items": [],
         "recommendations": [],
     }
-    try:
-        payload = require_json(request)
 
+    try:
         company = (payload.get("company") or "").strip()
         filing_type = (payload.get("filing_type") or "").strip()
         period = (payload.get("period") or "").strip()
@@ -47,11 +62,9 @@ def generate_report():
 
         if not company or not filing_type or not period:
             return (
-                jsonify(
-                    {
-                        "error": "Missing required fields: company, filing_type, period",
-                    }
-                ),
+                {
+                    "error": "Missing required fields: company, filing_type, period",
+                },
                 400,
             )
 
@@ -89,7 +102,7 @@ def generate_report():
         cached_result = _cache.get(cache_key)
         if cached_result is not None:
             cached_result["meta"]["cached"] = True
-            return jsonify(cached_result), 200
+            return cached_result, 200
 
         client = _get_client()
         content_str, groq_info = client.chat(
@@ -107,14 +120,71 @@ def generate_report():
         except ValueError as e:
             logger.error("JSON parsing failed for /generate-report: %s", e)
             groq_info["is_fallback"] = True
-            return jsonify({"data": fallback_response, "meta": groq_info}), 200
+            return {"data": fallback_response, "meta": groq_info}, 200
 
         response_data = build_response(parsed_content, groq_info, cached=False)
         _cache.set(cache_key, response_data)
-        return jsonify(response_data), 200
+        return response_data, 200
     except (ValueError, GroqServiceException) as e:
         logger.error("Error in /generate-report: %s", e)
-        return jsonify({"data": fallback_response, "meta": {"is_fallback": True, "error_detail": str(e)}}), 200
+        return (
+            {
+                "data": fallback_response,
+                "meta": {"is_fallback": True, "error_detail": str(e)},
+            },
+            200,
+        )
     except Exception as e:
         logger.exception("Unexpected error in /generate-report endpoint")
-        return jsonify({"data": fallback_response, "meta": {"is_fallback": True, "error_detail": str(e)}}), 200
+        return (
+            {
+                "data": fallback_response,
+                "meta": {"is_fallback": True, "error_detail": str(e)},
+            },
+            200,
+        )
+
+
+def _run_report_job(job_id: str, payload: dict[str, Any]) -> None:
+    _set_job(job_id, status="running")
+    response, status_code = _build_report_response(payload)
+    if status_code >= 400:
+        _set_job(job_id, status="failed", error=response)
+    else:
+        _set_job(job_id, status="completed", result=response)
+
+
+@bp.post("/generate-report")
+def generate_report():
+    try:
+        payload = require_json(request)
+        if payload.get("async") or payload.get("async_job"):
+            job_id = uuid.uuid4().hex
+            with _jobs_lock:
+                _jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "queued",
+                    "created_at": _utc_now(),
+                    "updated_at": _utc_now(),
+                }
+            worker = threading.Thread(
+                target=_run_report_job,
+                args=(job_id, dict(payload)),
+                daemon=True,
+            )
+            worker.start()
+            return jsonify({"job_id": job_id, "status": "queued"}), 202
+
+        response, status_code = _build_report_response(payload)
+        return jsonify(response), status_code
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@bp.get("/generate-report/jobs/<job_id>")
+def generate_report_job(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify(dict(job)), 200

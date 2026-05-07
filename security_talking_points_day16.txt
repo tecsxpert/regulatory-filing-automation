@@ -1,0 +1,45 @@
+DEMO DAY — AI Developer 3 Security Talking Points
+==================================================
+
+1. INPUT SANITISATION
+"Our InputSanitiser middleware blocks XSS, 
+prompt injection and email header injection 
+on every request. Invalid input returns 
+400 Bad Request."
+
+2. RATE LIMITING
+"flask-limiter enforces 30 requests per minute 
+on all endpoints and 10 per minute on 
+generate-report. Exceeding the limit 
+returns 429 with retry_after."
+
+3. SECURITY HEADERS
+"flask-talisman adds X-Content-Type-Options: 
+nosniff and X-Frame-Options: DENY to every 
+response — protecting against MIME sniffing 
+and clickjacking attacks."
+
+4. ZAP SCAN RESULTS
+"We ran both baseline and active OWASP ZAP 
+scans. Results show zero Critical and zero 
+High findings. One Medium finding is mitigated 
+by our InputSanitiser middleware."
+
+==================================================
+DEMO DAY STEPS (1 minute)
+
+Step 1: Show 401
+- Open terminal
+- Call API without token
+- Say: "Without JWT — 401 Unauthorized"
+
+Step 2: Show 400
+- Open Chrome Console F12
+- Run injection test
+- Say: "Injection blocked — 400 Bad Request"
+
+Step 3: Reference SECURITY.md
+- Hold up printed copy
+- Say: "Full report in SECURITY.md —
+  zero Critical, zero High findings"
+==================================================

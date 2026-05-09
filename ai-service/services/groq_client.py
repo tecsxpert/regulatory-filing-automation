@@ -1,116 +1,257 @@
-from __future__ import annotations
+"""
+GroqClient — AI Developer 2 core responsibility
+Handles all Groq API calls with:
+  - 3-retry exponential backoff
+  - Error logging
+  - Fallback template responses
+  - Response time tracking
+  - Token usage tracking
+"""
 
 import os
-from typing import Any
+import time
+import logging
+import json
+from groq import Groq, RateLimitError, APIStatusError, APIConnectionError
 
-import requests
+logger = logging.getLogger(__name__)
+
+# Fallback templates returned when Groq is unavailable
+FALLBACK_TEMPLATES = {
+    "describe": {
+        "description": "This regulatory filing requires review. AI analysis is temporarily unavailable. Please review manually.",
+        "key_points": ["Manual review required", "AI service temporarily unavailable"],
+        "summary": "Automated analysis unavailable. Please consult your compliance officer.",
+        "is_fallback": True,
+    },
+    "categorise": {
+        "category": "UNCATEGORIZED",
+        "confidence": 0.0,
+        "reasoning": "AI categorisation temporarily unavailable. Please categorise manually.",
+        "is_fallback": True,
+    },
+    "recommend": {
+        "recommendations": [
+            {
+                "action_type": "MANUAL_REVIEW",
+                "description": "AI recommendations temporarily unavailable. Conduct manual compliance review.",
+                "priority": "HIGH",
+            }
+        ],
+        "is_fallback": True,
+    },
+    "generate_report": {
+        "title": "Regulatory Filing Report",
+        "executive_summary": "AI report generation temporarily unavailable.",
+        "overview": "Please retry after a few minutes or contact your compliance officer.",
+        "top_items": [],
+        "recommendations": ["Retry AI report generation", "Manual review recommended"],
+        "is_fallback": True,
+    },
+    "query": {
+        "answer": "AI knowledge base is temporarily unavailable. Please consult your compliance documentation directly.",
+        "sources": [],
+        "is_fallback": True,
+    },
+    "analyse_document": {
+        "insights": [],
+        "risks": [],
+        "summary": "Document analysis temporarily unavailable.",
+        "is_fallback": True,
+    },
+    "default": {
+        "result": "AI processing temporarily unavailable. Please retry in a few minutes.",
+        "is_fallback": True,
+    },
+}
+
+# Registry for tracking response times (last 10 calls)
+_response_times: list[float] = []
+_cache_hits: int = 0
+_cache_misses: int = 0
+
+
+def record_response_time(ms: float):
+    global _response_times
+    _response_times.append(ms)
+    if len(_response_times) > 10:
+        _response_times = _response_times[-10:]
+
+
+def increment_cache_hit():
+    global _cache_hits
+    _cache_hits += 1
+
+
+def increment_cache_miss():
+    global _cache_misses
+    _cache_misses += 1
+
+
+def get_stats() -> dict:
+    avg = round(sum(_response_times) / len(_response_times), 2) if _response_times else 0
+    return {
+        "avg_response_time_ms": avg,
+        "last_10_response_times_ms": [round(t, 2) for t in _response_times],
+        "cache_hits": _cache_hits,
+        "cache_misses": _cache_misses,
+    }
 
 
 class GroqClient:
-    def __init__(
-        self,
-        api_key: str,
-        base_url: str = "https://api.groq.com/openai/v1",
-        default_model: str | None = None,
-        timeout_s: float = 30.0,
-    ):
-        self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
-        self._default_model = default_model
-        self._timeout_s = float(timeout_s)
-        self._session = requests.Session()
+    """
+    Singleton-style Groq API client.
+    All AI calls go through call_groq().
+    """
 
-    @staticmethod
-    def from_env() -> "GroqClient":
-        api_key = os.getenv("GROQ_API_KEY", "").strip()
+    MODEL = "llama-3.3-70b-versatile"
+    MAX_RETRIES = 3
+    BASE_DELAY = 1.0  # seconds, doubles each retry
+
+    def __init__(self):
+        api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            raise ValueError("GROQ_API_KEY is not set.")
-        base_url = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip()
-        default_model = os.getenv("GROQ_MODEL", "").strip() or "llama-3.1-8b-instant"
-        timeout_s = float(os.getenv("GROQ_TIMEOUT_S", "30"))
-        return GroqClient(
-            api_key=api_key,
-            base_url=base_url,
-            default_model=default_model,
-            timeout_s=timeout_s,
-        )
-
-    def chat(
-        self,
-        *,
-        system_prompt: str,
-        user_prompt: str,
-        model: str | None = None,
-        temperature: float = 0.2,
-        top_p: float = 1.0,
-        max_tokens: int = 512,
-        extra: dict[str, Any] | None = None,
-    ) -> tuple[str, dict[str, Any]]:
-        resolved_model = (model or self._default_model or "").strip()
-        if not resolved_model:
-            raise ValueError(
-                "Groq model is not set. Provide `model` in the request or set GROQ_MODEL."
+            self.client = None
+            logger.info(
+                "GROQ_API_KEY environment variable not set. AI calls will use fallback responses."
             )
+            return
+        self.client = Groq(api_key=api_key)
+        logger.info("GroqClient initialised with model %s", self.MODEL)
 
-        url = f"{self._base_url}/chat/completions"
-        payload: dict[str, Any] = {
-            "model": resolved_model,
-            "temperature": float(temperature),
-            "top_p": float(top_p),
-            "max_tokens": int(max_tokens),
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+    def call_groq(
+        self,
+        messages: list[dict],
+        temperature: float = 0.3,
+        max_tokens: int = 1000,
+        response_format: dict | None = None,
+        fallback_key: str = "default",
+    ) -> dict:
+        """
+        Call Groq with automatic retry and fallback.
+
+        Returns:
+            dict with keys:
+              - content (str): raw text response
+              - tokens_used (int)
+              - response_time_ms (float)
+              - model_used (str)
+              - is_fallback (bool)
+        """
+        if self.client is None:
+            logger.info(
+                "Groq client is not configured. Returning fallback for key '%s'.",
+                fallback_key,
+            )
+            return self._fallback_response(fallback_key)
+
+        last_error = None
+        delay = self.BASE_DELAY
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                start = time.time()
+
+                kwargs = {
+                    "model": self.MODEL,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                if response_format:
+                    kwargs["response_format"] = response_format
+
+                response = self.client.chat.completions.create(**kwargs)
+                elapsed_ms = round((time.time() - start) * 1000, 2)
+
+                record_response_time(elapsed_ms)
+                logger.info(
+                    "Groq call succeeded on attempt %d in %.1fms", attempt, elapsed_ms
+                )
+
+                return {
+                    "content": response.choices[0].message.content,
+                    "tokens_used": response.usage.total_tokens if response.usage else 0,
+                    "response_time_ms": elapsed_ms,
+                    "model_used": self.MODEL,
+                    "is_fallback": False,
+                }
+
+            except RateLimitError as e:
+                last_error = e
+                logger.warning(
+                    "Groq rate limit hit on attempt %d/%d. Waiting %.1fs.",
+                    attempt, self.MAX_RETRIES, delay,
+                )
+                time.sleep(delay)
+                delay *= 2
+
+            except APIConnectionError as e:
+                last_error = e
+                logger.warning(
+                    "Groq connection error on attempt %d/%d: %s. Waiting %.1fs.",
+                    attempt, self.MAX_RETRIES, str(e), delay,
+                )
+                time.sleep(delay)
+                delay *= 2
+
+            except APIStatusError as e:
+                last_error = e
+                if e.status_code in (500, 502, 503, 504):
+                    logger.warning(
+                        "Groq server error %d on attempt %d/%d. Waiting %.1fs.",
+                        e.status_code, attempt, self.MAX_RETRIES, delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    # 4xx errors — no point retrying
+                    logger.error("Groq API error %d: %s", e.status_code, str(e))
+                    break
+
+            except Exception as e:
+                last_error = e
+                logger.error("Unexpected error calling Groq: %s", str(e))
+                break
+
+        # All retries exhausted — return fallback
+        logger.error(
+            "All %d Groq retries exhausted. Last error: %s. Returning fallback for key '%s'.",
+            self.MAX_RETRIES, str(last_error), fallback_key,
+        )
+        return self._fallback_response(fallback_key)
+
+    def parse_json_response(self, raw: str) -> dict:
+        """Safely parse JSON from Groq response, stripping markdown fences."""
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            # Remove first and last fence lines
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            cleaned = "\n".join(lines).strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logger.error("JSON parse failed: %s\nRaw: %s", str(e), raw[:200])
+            return {"parse_error": str(e), "raw": raw}
+
+    def _fallback_response(self, fallback_key: str = "default") -> dict:
+        fallback_data = FALLBACK_TEMPLATES.get(fallback_key, FALLBACK_TEMPLATES["default"])
+        return {
+            "content": json.dumps(fallback_data),
+            "tokens_used": 0,
+            "response_time_ms": 0,
+            "model_used": self.MODEL,
+            "is_fallback": True,
         }
-        if extra:
-            payload.update(extra)
 
-        resp = self._session.post(
-            url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=self._timeout_s,
-        )
-        raw: dict[str, Any]
-        try:
-            raw = resp.json()
-        except Exception:
-            raw = {"status_code": resp.status_code, "text": resp.text}
 
-        if resp.status_code >= 400:
-            raise ValueError(f"Groq API error ({resp.status_code}): {raw}")
+# Module-level singleton
+_groq_client: GroqClient | None = None
 
-        content = (
-            raw.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
-        return str(content), raw
 
-    def list_models(self) -> list[dict[str, Any]]:
-        url = f"{self._base_url}/models"
-        resp = self._session.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=self._timeout_s,
-        )
-        raw: dict[str, Any]
-        try:
-            raw = resp.json()
-        except Exception:
-            raw = {"status_code": resp.status_code, "text": resp.text}
-
-        if resp.status_code >= 400:
-            raise ValueError(f"Groq API error ({resp.status_code}): {raw}")
-
-        data = raw.get("data", [])
-        if not isinstance(data, list):
-            return []
-        return [m for m in data if isinstance(m, dict)]
+def get_groq_client() -> GroqClient:
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = GroqClient()
+    return _groq_client

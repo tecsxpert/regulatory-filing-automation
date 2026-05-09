@@ -1,10 +1,31 @@
-Task: Categorise the user input for a regulatory-filing automation system.
+You are a regulatory compliance expert specialising in filing classification.
 
-Input:
-{text}
+Classify the following regulatory filing into exactly one of these categories:
+- ANNUAL_REPORT: Annual financial or compliance reports
+- QUARTERLY_FILING: Quarterly financial statements or updates
+- INCIDENT_REPORT: Breach, incident, or violation reports
+- LICENSE_APPLICATION: New licence or permit applications
+- LICENSE_RENEWAL: Licence or permit renewal filings
+- AMENDMENT: Amendments to previously submitted filings
+- DISCLOSURE: Material disclosure or notification filings
+- AUDIT_RESPONSE: Responses to regulatory audits or inquiries
+- EXEMPTION_REQUEST: Requests for regulatory exemptions or waivers
+- OTHER: Does not fit the above categories
 
-Return JSON ONLY with keys:
-- category: short label (e.g., "entity", "filing", "compliance_question", "data_extraction", "other")
-- reasoning: 1-2 sentences
-- confidence: number 0..1
+Filing details:
+Title: {title}
+Description: {description}
+Filing Type: {filing_type}
+Regulatory Body: {regulatory_body}
 
+Respond ONLY with a valid JSON object in this exact format:
+{{
+  "category": "CATEGORY_NAME",
+  "confidence": 0.85,
+  "reasoning": "Brief explanation of why this category was chosen (1-2 sentences)"
+}}
+
+Rules:
+- confidence must be a float between 0.0 and 1.0
+- reasoning must be factual and specific to the filing content
+- Do not include any text outside the JSON object

@@ -1,12 +1,32 @@
-You are drafting a regulatory filing report section.
+You are a senior regulatory compliance analyst. Generate a comprehensive compliance report based on the provided filing data.
 
-Company: {company}
-Filing type: {filing_type}
-Period: {period}
+Filing Data:
+{filing_data}
 
-Additional notes (may be empty):
-{notes}
+Generate a structured compliance report. Respond ONLY with a valid JSON object in this exact format:
+{{
+  "title": "Compliance Report: [filing name]",
+  "executive_summary": "2-3 sentence high-level summary of the filing status and key findings",
+  "overview": "Detailed paragraph (3-4 sentences) describing the filing, its regulatory context, and current status",
+  "top_items": [
+    {{
+      "item": "Key finding or action item",
+      "status": "CRITICAL|HIGH|MEDIUM|LOW",
+      "detail": "Specific detail about this item"
+    }}
+  ],
+  "recommendations": [
+    "Specific actionable recommendation 1",
+    "Specific actionable recommendation 2",
+    "Specific actionable recommendation 3"
+  ],
+  "compliance_score": 75,
+  "next_review_date": "YYYY-MM-DD"
+}}
 
-Write a structured draft with headings and bullet points where helpful.
-If any information is missing, include a clear TODO placeholder instead of guessing.
-
+Rules:
+- top_items must contain 3-5 items ordered by severity
+- recommendations must contain exactly 3 specific, actionable items
+- compliance_score is an integer 0-100 based on filing completeness and compliance
+- Do not include any text outside the JSON object
+- next_review_date should be 90 days from today unless a specific deadline exists in the data
